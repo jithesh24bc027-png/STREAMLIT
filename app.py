@@ -1,5 +1,6 @@
 import os
 import streamlit as st
+import chromadb
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -96,28 +97,46 @@ st.sidebar.write("---")
 st.sidebar.header("📂 Document Ingestion")
 uploaded_file = st.sidebar.file_uploader("Upload a Contract (PDF)", type=["pdf"])
 
+# Initialize session state for retriever so it persistent across clicks
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
+
 # Processing logic runs when a file is dropped in
 if uploaded_file and api_key_input:
-    # Save the file temporarily to pass to PyPDFLoader
-    temp_pdf_path = f"temp_{uploaded_file.name}"
-    with open(temp_pdf_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+    # Check if we have already indexed this exact file to avoid running it repeatedly
+    if st.session_state.retriever is None:
+        temp_pdf_path = f"temp_{uploaded_file.name}"
+        with open(temp_pdf_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
 
-    with st.sidebar.spinner("Parsing & Indexing Agreement..."):
-        # Load and Chunk
-        loader = PyPDFLoader(temp_pdf_path)
-        docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=250)
-        splits = text_splitter.split_documents(docs)
-        
-        # Build vector store
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-        st.sidebar.success("Contract Fully Indexed!")
+        with st.sidebar.spinner("Parsing & Indexing Agreement..."):
+            # Load and Chunk
+            loader = PyPDFLoader(temp_pdf_path)
+            docs = loader.load()
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=250)
+            splits = text_splitter.split_documents(docs)
+            
+            # Explicitly create an ephemeral (in-memory) Chroma Client to prevent schema/ValueError conflicts
+            chroma_client = chromadb.EphemeralClient()
+            vectorstore = Chroma.from_documents(
+                documents=splits, 
+                embedding=embeddings,
+                client=chroma_client
+            )
+            # Store the retriever safely in state
+            st.session_state.retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+            st.sidebar.success("Contract Fully Indexed!")
 
-    # Clean up temporary file
-    if os.path.exists(temp_pdf_path):
-        os.remove(temp_pdf_path)
+        # Clean up temporary file
+        if os.path.exists(temp_pdf_path):
+            os.remove(temp_pdf_path)
+else:
+    # Clear retriever state if file is removed
+    st.session_state.retriever = None
+
+# Check if retriever is ready and execute layout
+if st.session_state.retriever is not None and api_key_input:
+    retriever = st.session_state.retriever
 
     # --- Feature Navigation Tabs ---
     st.write("### 🛠️ Select Analysis Feature")
