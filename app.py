@@ -1,6 +1,5 @@
 import os
 import streamlit as st
-import chromadb
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -16,14 +15,16 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 1. Model Initialization ---
+# --- 1. Model & Session Initialization ---
 @st.cache_resource
 def initialize_models():
     """Cache models so they don't reload on every user interaction."""
+    # Initialize the ultra-fast Groq LLM
     llm = ChatGroq(
         model_name="llama3-70b-8192",
-        temperature=0.2  # Low temperature for high legal precision
+        temperature=0.2  # Low temperature for strict legal accuracy
     )
+    # Load local open-source embedding model
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     return llm, embeddings
 
@@ -36,16 +37,14 @@ except Exception as e:
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-# --- 2. Dynamic RAG Chain Generator Engine ---
-def run_legal_chain(prompt_template, retriever, input_text):
-    """Creates and invokes the chain dynamically so 'retriever' is never undefined."""
-    chain = (
+# --- 2. RAG Chain Generator Engine ---
+def create_rag_chain(prompt_template, retriever):
+    return (
         {"context": retriever | format_docs, "question": lambda x: x}
         | prompt_template
         | llm
         | StrOutputParser()
     )
-    return chain.invoke(input_text)
 
 # --- 3. Legal Prompt Templates ---
 qa_prompt = ChatPromptTemplate.from_template(
@@ -65,18 +64,18 @@ clause_prompt = ChatPromptTemplate.from_template(
 )
 
 risk_prompt = ChatPromptTemplate.from_template(
-    "You are a critical legal risk assessor. Please identify any hidden liabilities, high-risk elements, "
+    "You are a critical legal risk assessor. Analyze the text and explicitly identify any hidden liabilities, high-risk elements, "
     "harsh penalty metrics, automatic renewals, or lopsided termination constraints.\n\nContext:\n{context}\n\nIdentified Risks:"
 )
 
 terms_prompt = ChatPromptTemplate.from_template(
-    "Extract the most important defined legal terms along with their specific definitions from the text. "
-    "Format as 'Term: Definition'.\n\nContext:\n{context}\n\nCore Defined Terms:"
+    "Extract the most important defined legal terms (e.g., Disclosing Party, Indemnitee) along with their specific concise "
+    "definitions from the text. Format as 'Term: Definition'.\n\nContext:\n{context}\n\nCore Defined Terms:"
 )
 
 simplification_prompt = ChatPromptTemplate.from_template(
     "You are a legal educator. Take the complex legal jargon (legalese) from the contract context and translate it "
-    "into plain, straightforward English.\n\nContext:\n{context}\n\nPlain English Breakdown:"
+    "into plain, straightforward English that an ordinary business owner would understand instantly.\n\nContext:\n{context}\n\nPlain English Breakdown:"
 )
 
 # --- 4. Streamlit UI Layout ---
@@ -97,43 +96,30 @@ st.sidebar.write("---")
 st.sidebar.header("📂 Document Ingestion")
 uploaded_file = st.sidebar.file_uploader("Upload a Contract (PDF)", type=["pdf"])
 
-# Keep the retriever alive across UI refreshes using session_state
-if "retriever" not in st.session_state:
-    st.session_state.retriever = None
-
-# Ingest document when uploaded
+# Processing logic runs when a file is dropped in
 if uploaded_file and api_key_input:
-    if st.session_state.retriever is None:
-        temp_pdf_path = f"temp_{uploaded_file.name}"
-        with open(temp_pdf_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+    # Save the file temporarily to pass to PyPDFLoader
+    temp_pdf_path = f"temp_{uploaded_file.name}"
+    with open(temp_pdf_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
-        with st.sidebar.spinner("Parsing & Indexing Agreement..."):
-            loader = PyPDFLoader(temp_pdf_path)
-            docs = loader.load()
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=250)
-            splits = text_splitter.split_documents(docs)
-            
-            # Using an ephemeral client to ensure no cross-session database contamination
-            chroma_client = chromadb.EphemeralClient()
-            vectorstore = Chroma.from_documents(
-                documents=splits, 
-                embedding=embeddings,
-                client=chroma_client
-            )
-            st.session_state.retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-            st.sidebar.success("Contract Fully Indexed!")
+    with st.sidebar.spinner("Parsing & Indexing Agreement..."):
+        # Load and Chunk
+        loader = PyPDFLoader(temp_pdf_path)
+        docs = loader.load()
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=250)
+        splits = text_splitter.split_documents(docs)
+        
+        # Build vector store
+        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+        st.sidebar.success("Contract Fully Indexed!")
 
-        if os.path.exists(temp_pdf_path):
-            os.remove(temp_pdf_path)
-else:
-    if not uploaded_file:
-        st.session_state.retriever = None
+    # Clean up temporary file
+    if os.path.exists(temp_pdf_path):
+        os.remove(temp_pdf_path)
 
-# Render tabs and operations ONLY if retriever is active
-if st.session_state.retriever is not None and api_key_input:
-    current_retriever = st.session_state.retriever
-
+    # --- Feature Navigation Tabs ---
     st.write("### 🛠️ Select Analysis Feature")
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "💬 Interactive Chat", 
@@ -149,8 +135,9 @@ if st.session_state.retriever is not None and api_key_input:
         st.subheader("💬 Ask the Contract Anything")
         user_query = st.text_input("Enter your question regarding specific clauses or parameters:")
         if user_query:
+            qa_chain = create_rag_chain(qa_prompt, retriever)
             with st.spinner("Searching document background..."):
-                answer = run_legal_chain(qa_prompt, current_retriever, user_query)
+                answer = qa_chain.invoke(user_query)
             st.markdown("#### **Answer:**")
             st.write(answer)
 
@@ -158,29 +145,46 @@ if st.session_state.retriever is not None and api_key_input:
     with tab2:
         st.subheader("📝 Contract Summary & Executive Overview")
         if st.button("Generate Summary"):
+            summary_chain = create_rag_chain(summary_prompt, retriever)
             with st.spinner("Synthesizing executive summary..."):
-                summary = run_legal_chain(summary_prompt, current_retriever, "Provide an overview summary highlighting parties, dates, and terms.")
+                summary = summary_chain.invoke("Provide an overview summary highlighting parties, dates, and terms.")
             st.markdown(summary)
 
     # Feature 3: Clause Extraction
     with tab3:
         st.subheader("🔍 Key Clause & Compliance Structural Extraction")
         if st.button("Extract Core Clauses"):
+            clause_chain = create_rag_chain(clause_prompt, retriever)
             with st.spinner("Analyzing contract structure..."):
-                clauses = run_legal_chain(clause_prompt, current_retriever, "Extract key operational boilerplate or core compliance clauses.")
+                clauses = clause_chain.invoke("Extract key operational boilerplate or core compliance clauses.")
             st.markdown(clauses)
 
     # Feature 4: Risk Identification
     with tab4:
         st.subheader("⚠️ Hidden Liabilities & Financial Risk Audit")
         if st.button("Run Risk Assessment"):
+            risk_chain = create_rag_chain(risk_prompt, retriever)
             with st.spinner("Auditing contract text for hidden liabilities..."):
-                risks = run_legal_chain(risk_prompt, current_retriever, "Scan for indemnity, high damages, automatic renewals, and severe penalty risks.")
+                risks = risk_chain.invoke("Scan for indemnity, high damages, automatic renewals, and severe penalty risks.")
             st.markdown(risks)
 
     # Feature 5: Defined Terms Extraction
     with tab5:
         st.subheader("📖 Core Defined Contract Entities")
         if st.button("Extract Core Definitions"):
+            terms_chain = create_rag_chain(terms_prompt, retriever)
             with st.spinner("Compiling legal glossary definitions..."):
-                terms = run_legal_chain(terms_prompt, current_retriever, "Extract definitions, key naming terms, or capital defined phrases.")
+                terms = terms_chain.invoke("Extract definitions, key naming terms, or capital defined phrases.")
+            st.markdown(terms)
+
+    # Feature 6: Simplified Explanations
+    with tab6:
+        st.subheader("💡 Legalese to Plain English Translation")
+        if st.button("Simplify Legal Jargon"):
+            simplification_chain = create_rag_chain(simplification_prompt, retriever)
+            with st.spinner("Translating legal phrases into standard English..."):
+                simplifications = simplification_chain.invoke("Simplify complex legal jargon into straightforward summaries.")
+            st.markdown(simplifications)
+
+elif not uploaded_file:
+    st.info("👈 Please upload a legal agreement PDF in the sidebar to initiate analysis features.")
