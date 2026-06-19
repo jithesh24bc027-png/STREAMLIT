@@ -1,117 +1,190 @@
-import streamlit as st
 import os
-import tempfile
+import streamlit as st
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
-st.set_page_config(page_title="LegalDoc AI", page_icon="\u2696\ufe0f", layout="wide")
-st.title("\u2696\ufe0f Legal Document Assistant")
-st.caption("Upload agreements & contracts to extract clauses, spot risks, and get plain-language explanations.")
-st.divider()
+# --- Page Configuration ---
+st.set_page_config(
+    page_title="Team 4: Legal Document Assistant",
+    page_icon="⚖️",
+    layout="wide"
+)
 
-with st.sidebar:
-    st.header("\u2699\ufe0f Setup")
-    groq_key = st.text_input("Groq API Key", type="password", placeholder="gsk_...")
-    uploaded_files = st.file_uploader(
-        "Upload Agreement(s)/Contract(s) (PDF)",
-        type=["pdf"],
-        accept_multiple_files=True
+# --- 1. Model & Session Initialization ---
+@st.cache_resource
+def initialize_models():
+    """Cache models so they don't reload on every user interaction."""
+    # Initialize the ultra-fast Groq LLM
+    llm = ChatGroq(
+        model_name="llama3-70b-8192",
+        temperature=0.2  # Low temperature for strict legal accuracy
     )
-    process_btn = st.button("\u26a1 Analyse Document(s)", use_container_width=True)
+    # Load local open-source embedding model
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return llm, embeddings
 
-    st.divider()
-    st.subheader("\U0001f50d Quick Actions")
-    quick_summary_btn = st.button("\U0001f4c4 Contract Summary", use_container_width=True)
-    quick_clauses_btn = st.button("\U0001f4cc Extract Key Clauses", use_container_width=True)
-    quick_risks_btn = st.button("\u26a0\ufe0f Identify Risks", use_container_width=True)
+try:
+    llm, embeddings = initialize_models()
+except Exception as e:
+    st.error("Error initializing models. Please make sure GROQ_API_KEY is set correctly.")
 
-    st.warning("\u26a0\ufe0f For informational purposes only. This is not legal advice \u2014 consult a qualified lawyer for binding decisions.")
+# Helper function to format documents for the LLM
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "qa_chain" not in st.session_state:
-    st.session_state.qa_chain = None
+# --- 2. RAG Chain Generator Engine ---
+def create_rag_chain(prompt_template, retriever):
+    return (
+        {"context": retriever | format_docs, "question": lambda x: x}
+        | prompt_template
+        | llm
+        | StrOutputParser()
+    )
 
-if process_btn:
-    if not groq_key or not uploaded_files:
-        st.sidebar.error("Please provide both API key and at least one PDF.")
-    else:
-        with st.spinner("Reading document(s)..."):
-            from langchain_community.document_loaders import PyPDFLoader
-            from langchain_text_splitters import RecursiveCharacterTextSplitter
-            from langchain_community.embeddings import HuggingFaceEmbeddings
-            from langchain_community.vectorstores import FAISS
-            from langchain_openai import ChatOpenAI
-            from langchain_core.prompts import PromptTemplate
-            from langchain_core.runnables import RunnablePassthrough
-            from langchain_core.output_parsers import StrOutputParser
+# --- 3. Legal Prompt Templates ---
+qa_prompt = ChatPromptTemplate.from_template(
+    "You are a helpful, precise legal AI assistant. Use the following context from the contract to answer the question.\n"
+    "If you cannot find the answer, say 'I cannot find that information in the provided document.'\n\n"
+    "Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+)
 
-            all_documents = []
-            for uploaded_file in uploaded_files:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_file.read())
-                    tmp_path = tmp.name
-                all_documents.extend(PyPDFLoader(tmp_path).load())
-                os.unlink(tmp_path)
+summary_prompt = ChatPromptTemplate.from_template(
+    "You are an expert corporate legal counsel. Provide a clear, highly structured executive summary of the contract below. "
+    "Highlight key dates, parties, and core arrangements.\n\nContext:\n{context}\n\nExecutive Summary:"
+)
 
-            documents = all_documents
-            docs = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50).split_documents(documents)
-            embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-large-en-v1.5")
-            vectorstore = FAISS.from_documents(docs, embeddings)
-            retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
+clause_prompt = ChatPromptTemplate.from_template(
+    "You are an expert legal document analyst. Extract and list the core legal sections and clauses present in this context "
+    "(e.g., Indemnification, Governing Law, Force Majeure, etc.).\n\nContext:\n{context}\n\nExtracted Clauses:"
+)
 
-            llm = ChatOpenAI(
-                model="llama-3.3-70b-versatile",
-                api_key=groq_key,
-                base_url="https://api.groq.com/openai/v1"
-            )
+risk_prompt = ChatPromptTemplate.from_template(
+    "You are a critical legal risk assessor. Analyze the text and explicitly identify any hidden liabilities, high-risk elements, "
+    "harsh penalty metrics, automatic renewals, or lopsided termination constraints.\n\nContext:\n{context}\n\nIdentified Risks:"
+)
 
-            prompt = PromptTemplate(
-                template="""You are a legal document assistant. Use the context to explain the contract in simple language, extract key clauses (termination, payment, liability, confidentiality, indemnity, etc.), and flag risky or one-sided terms with \u26a0\ufe0f.
-Context: {context}
-Question: {question}
-Answer (plain language, not formal legal advice):""",
-                input_variables=["context", "question"]
-            )
+terms_prompt = ChatPromptTemplate.from_template(
+    "Extract the most important defined legal terms (e.g., Disclosing Party, Indemnitee) along with their specific concise "
+    "definitions from the text. Format as 'Term: Definition'.\n\nContext:\n{context}\n\nCore Defined Terms:"
+)
 
-            def fmt(docs):
-                return "\n\n".join(d.page_content for d in docs)
+simplification_prompt = ChatPromptTemplate.from_template(
+    "You are a legal educator. Take the complex legal jargon (legalese) from the contract context and translate it "
+    "into plain, straightforward English that an ordinary business owner would understand instantly.\n\nContext:\n{context}\n\nPlain English Breakdown:"
+)
 
-            st.session_state.qa_chain = (
-                {"context": retriever | fmt, "question": RunnablePassthrough()}
-                | prompt | llm | StrOutputParser()
-            )
-            st.session_state.messages = []
-        st.sidebar.success(f"\u2705 Done! {len(documents)} pages loaded from {len(uploaded_files)} file(s).")
+# --- 4. Streamlit UI Layout ---
+st.title("⚖️ Team 4: Legal Document Assistant")
+st.write("An AI-powered RAG application to analyze, parse, simplify, and audit complex legal contracts.")
+st.write("---")
 
-quick_prompts = {
-    "summary": "Provide a concise summary of this contract, including the parties involved, purpose, and key obligations.",
-    "clauses": "Extract and list the key clauses in this document (e.g. termination, payment terms, liability, confidentiality, indemnity, dispute resolution).",
-    "risks": "Identify any risky, unusual, or one-sided clauses in this document and explain why they could be a concern.",
-}
+# Sidebar Configuration
+st.sidebar.header("🔑 Authentication & Setup")
+api_key_input = st.sidebar.text_input("Enter Groq API Key:", type="password", value=os.getenv("GROQ_API_KEY", ""))
 
-triggered_query = None
-if quick_summary_btn:
-    triggered_query = quick_prompts["summary"]
-elif quick_clauses_btn:
-    triggered_query = quick_prompts["clauses"]
-elif quick_risks_btn:
-    triggered_query = quick_prompts["risks"]
-
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
-
-if st.session_state.qa_chain:
-    user_input = st.chat_input("Ask about your contract/agreement...")
-    final_query = user_input or triggered_query
-
-    if final_query:
-        st.session_state.messages.append({"role": "user", "content": final_query})
-        with st.chat_message("user"):
-            st.write(final_query)
-        with st.chat_message("assistant"):
-            with st.spinner("Analysing..."):
-                answer = st.session_state.qa_chain.invoke(final_query)
-            st.write(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+if api_key_input:
+    os.environ["GROQ_API_KEY"] = api_key_input
 else:
-    st.info("\U0001f448 Upload your PDF(s) and click Analyse Document(s) to start.")
+    st.sidebar.warning("Please enter your Groq API Key to run the assistant.")
+
+st.sidebar.write("---")
+st.sidebar.header("📂 Document Ingestion")
+uploaded_file = st.sidebar.file_uploader("Upload a Contract (PDF)", type=["pdf"])
+
+# Processing logic runs when a file is dropped in
+if uploaded_file and api_key_input:
+    # Save the file temporarily to pass to PyPDFLoader
+    temp_pdf_path = f"temp_{uploaded_file.name}"
+    with open(temp_pdf_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    with st.sidebar.spinner("Parsing & Indexing Agreement..."):
+        # Load and Chunk
+        loader = PyPDFLoader(temp_pdf_path)
+        docs = loader.load()
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=250)
+        splits = text_splitter.split_documents(docs)
+        
+        # Build vector store
+        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+        st.sidebar.success("Contract Fully Indexed!")
+
+    # Clean up temporary file
+    if os.path.exists(temp_pdf_path):
+        os.remove(temp_pdf_path)
+
+    # --- Feature Navigation Tabs ---
+    st.write("### 🛠️ Select Analysis Feature")
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "💬 Interactive Chat", 
+        "📝 Contract Summary", 
+        "🔍 Clause Extraction", 
+        "⚠️ Risk Assessment", 
+        "📖 Defined Terms", 
+        "💡 Plain English"
+    ])
+
+    # Feature 1: Interactive QA
+    with tab1:
+        st.subheader("💬 Ask the Contract Anything")
+        user_query = st.text_input("Enter your question regarding specific clauses or parameters:")
+        if user_query:
+            qa_chain = create_rag_chain(qa_prompt, retriever)
+            with st.spinner("Searching document background..."):
+                answer = qa_chain.invoke(user_query)
+            st.markdown("#### **Answer:**")
+            st.write(answer)
+
+    # Feature 2: Executive Summary
+    with tab2:
+        st.subheader("📝 Contract Summary & Executive Overview")
+        if st.button("Generate Summary"):
+            summary_chain = create_rag_chain(summary_prompt, retriever)
+            with st.spinner("Synthesizing executive summary..."):
+                summary = summary_chain.invoke("Provide an overview summary highlighting parties, dates, and terms.")
+            st.markdown(summary)
+
+    # Feature 3: Clause Extraction
+    with tab3:
+        st.subheader("🔍 Key Clause & Compliance Structural Extraction")
+        if st.button("Extract Core Clauses"):
+            clause_chain = create_rag_chain(clause_prompt, retriever)
+            with st.spinner("Analyzing contract structure..."):
+                clauses = clause_chain.invoke("Extract key operational boilerplate or core compliance clauses.")
+            st.markdown(clauses)
+
+    # Feature 4: Risk Identification
+    with tab4:
+        st.subheader("⚠️ Hidden Liabilities & Financial Risk Audit")
+        if st.button("Run Risk Assessment"):
+            risk_chain = create_rag_chain(risk_prompt, retriever)
+            with st.spinner("Auditing contract text for hidden liabilities..."):
+                risks = risk_chain.invoke("Scan for indemnity, high damages, automatic renewals, and severe penalty risks.")
+            st.markdown(risks)
+
+    # Feature 5: Defined Terms Extraction
+    with tab5:
+        st.subheader("📖 Core Defined Contract Entities")
+        if st.button("Extract Core Definitions"):
+            terms_chain = create_rag_chain(terms_prompt, retriever)
+            with st.spinner("Compiling legal glossary definitions..."):
+                terms = terms_chain.invoke("Extract definitions, key naming terms, or capital defined phrases.")
+            st.markdown(terms)
+
+    # Feature 6: Simplified Explanations
+    with tab6:
+        st.subheader("💡 Legalese to Plain English Translation")
+        if st.button("Simplify Legal Jargon"):
+            simplification_chain = create_rag_chain(simplification_prompt, retriever)
+            with st.spinner("Translating legal phrases into standard English..."):
+                simplifications = simplification_chain.invoke("Simplify complex legal jargon into straightforward summaries.")
+            st.markdown(simplifications)
+
+elif not uploaded_file:
+    st.info("👈 Please upload a legal agreement PDF in the sidebar to initiate analysis features.")
