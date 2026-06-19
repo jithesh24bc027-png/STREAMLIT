@@ -6,3 +6,4 @@ langchain-text-splitters
 langchain-groq
 pypdf
 sentence-transformers
+protobuf<5.0.0
